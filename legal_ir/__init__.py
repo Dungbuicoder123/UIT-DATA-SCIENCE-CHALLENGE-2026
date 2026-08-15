@@ -1,0 +1,3 @@
+"""
+LegalIR package init.
+"""
