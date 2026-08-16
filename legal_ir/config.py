@@ -15,22 +15,50 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Directory / file paths  (relative to project root)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Directory / file paths (supports environment variable overrides for Google Colab)
+# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-DATA_DIR              = os.path.join(BASE_DIR, "data")
-CONTEXTS_DIR          = os.path.join(DATA_DIR, "selected-contexts")   # unzipped folder
+DATA_DIR              = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
+CONTEXTS_DIR          = os.environ.get("CONTEXTS_DIR", os.path.join(DATA_DIR, "selected-contexts"))
 TRAIN_FILE            = os.path.join(DATA_DIR, "train.json")
 PUBLIC_TEST_FILE      = os.path.join(DATA_DIR, "public-official.json")
-OUTPUT_DIR            = os.path.join(BASE_DIR, "output")
+OUTPUT_DIR            = os.environ.get("OUTPUT_DIR", os.path.join(BASE_DIR, "output"))
 SUBMISSION_JSON_PATH  = os.path.join(OUTPUT_DIR, "submission.json")
 SUBMISSION_ZIP_PATH   = os.path.join(OUTPUT_DIR, "submission.zip")
 
 # Cache paths (avoid recomputing heavy embeddings every run)
-CACHE_DIR             = os.path.join(BASE_DIR, ".cache")
+CACHE_DIR             = os.environ.get("CACHE_DIR", os.path.join(BASE_DIR, ".cache"))
 CORPUS_CACHE_PATH     = os.path.join(CACHE_DIR, "preprocessed_corpus.pkl")
 BM25_CACHE_PATH       = os.path.join(CACHE_DIR, "bm25_index.pkl")
 EMBEDDINGS_CACHE_PATH = os.path.join(CACHE_DIR, "corpus_embeddings.npy")
 DOC_IDS_CACHE_PATH    = os.path.join(CACHE_DIR, "doc_ids.pkl")
+
+
+def set_custom_paths(
+    data_dir: Optional[str] = None,
+    contexts_dir: Optional[str] = None,
+    output_dir: Optional[str] = None,
+) -> None:
+    """Override dataset and output paths dynamically at runtime."""
+    global DATA_DIR, CONTEXTS_DIR, TRAIN_FILE, PUBLIC_TEST_FILE
+    global OUTPUT_DIR, SUBMISSION_JSON_PATH, SUBMISSION_ZIP_PATH
+
+    if data_dir:
+        DATA_DIR = os.path.abspath(data_dir)
+        TRAIN_FILE = os.path.join(DATA_DIR, "train.json")
+        PUBLIC_TEST_FILE = os.path.join(DATA_DIR, "public-official.json")
+        if not contexts_dir:
+            CONTEXTS_DIR = os.path.join(DATA_DIR, "selected-contexts")
+
+    if contexts_dir:
+        CONTEXTS_DIR = os.path.abspath(contexts_dir)
+
+    if output_dir:
+        OUTPUT_DIR = os.path.abspath(output_dir)
+        SUBMISSION_JSON_PATH = os.path.join(OUTPUT_DIR, "submission.json")
+        SUBMISSION_ZIP_PATH = os.path.join(OUTPUT_DIR, "submission.zip")
 
 
 # ---------------------------------------------------------------------------
