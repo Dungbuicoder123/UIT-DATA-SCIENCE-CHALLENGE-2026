@@ -1,3 +1,1 @@
-"""
-LegalIR package init.
-"""
+"""LegalIR package init."""
