@@ -41,7 +41,7 @@ class BM25Config:
 @dataclass
 class DenseConfig:
     model_name: str = "AITeamVN/Vietnamese_Embedding"
-    encode_batch_size: int = 512
+    encode_batch_size: int = 128
     use_gpu: bool = True
     enabled: bool = True
     max_seq_length: int = 2048
