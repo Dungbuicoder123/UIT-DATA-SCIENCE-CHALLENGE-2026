@@ -25,24 +25,16 @@ CHUNK_MAP_CACHE_PATH = os.path.join(CACHE_DIR, "chunk_map.pkl")
 class TextConfig:
     word_segmenter: str = "pyvi"
     lowercase: bool = True
-    # Bật Query Expansion (bung từ viết tắt pháp lý trước khi tokenize)
-    query_expansion: bool = True
 
 @dataclass
 class ChunkingConfig:
     enabled: bool = True
     chunk_size_words: int = 256
     chunk_overlap_words: int = 64
-    # Bật Article-level chunking: ưu tiên cắt tại ranh giới Điều luật
-    # thay vì cắt mù theo số từ
-    article_aware: bool = True
-    # Inject document header vào đầu mỗi chunk
-    inject_header: bool = True
 
 @dataclass
 class BM25Config:
-    # Tăng lên 150 để đảm bảo không bỏ sót, sau đó RRF sẽ lọc
-    top_k_stage1: int = 150
+    top_k_stage1: int = 100  # Tăng lên 100 để lấy nhiều ứng viên (chunk) hơn cho RRF
     variant: str = "BM25Okapi"
     name_boost: float = 2.0
 
@@ -53,34 +45,19 @@ class DenseConfig:
     use_gpu: bool = True
     enabled: bool = True
     max_seq_length: int = 2048
-    # ---- MỚI: Full-Corpus Dense Search ----
-    # Số chunk lấy từ toàn bộ corpus bằng dot-product similarity search
-    # (độc lập với BM25 — đây là True Full-Corpus ANN search)
-    dense_top_k: int = 150
 
 @dataclass
 class CrossEncoderConfig:
     enabled: bool = True
     model_name: str = "AITeamVN/Vietnamese_Reranker"
     use_gpu: bool = True
-    # Số chunk đưa vào Cross-Encoder (từ RRF output)
-    top_k_stage3: int = 30
+    top_k_stage3: int = 20  # Lấy top 20 chunk cao điểm nhất từ RRF để rerank
 
 @dataclass
 class HybridConfig:
     fusion_method: str = "rrf"  # Dùng RRF
     rrf_k: int = 60
     max_docs_per_query: int = 5
-
-    # ---- MỚI: Dynamic Margin Thresholding ----
-    # Bật/tắt bộ lọc điểm số động (tối ưu Precision mà không mất Recall)
-    dynamic_threshold_enabled: bool = True
-    # Ngưỡng điểm tuyệt đối tối thiểu để giữ một document
-    # (Cross-Encoder logit score, thường dao động từ -10 đến +10)
-    min_ce_score: float = -3.0
-    # Ngưỡng khoảng cách tối đa so với top-1 score
-    # Nếu (score_top1 - score_i) > score_margin → bỏ doc_i
-    score_margin: float = 7.0
 
 @dataclass
 class Config:
