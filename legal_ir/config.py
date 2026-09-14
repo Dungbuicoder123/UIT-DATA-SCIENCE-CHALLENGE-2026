@@ -80,7 +80,7 @@ class HybridConfig:
     min_ce_score: float = -3.0
     # Ngưỡng khoảng cách tối đa so với top-1 score
     # Nếu (score_top1 - score_i) > score_margin → bỏ doc_i
-    score_margin: float = 4.5
+    score_margin: float = 7.0
 
 @dataclass
 class Config:
