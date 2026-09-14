@@ -1,9 +1,6 @@
 """
-LegalIR — Hybrid Ranker
-Nâng cấp:
-  1. True Full-Corpus Dense Search (song song với BM25, không phụ thuộc vào nhau)
-  2. RRF Fusion trên union của 2 candidate lists
-  3. Dynamic Margin Thresholding sau Cross-Encoder (tối ưu Precision)
+LegalIR — Hybrid Ranker 
+Nâng cấp: Hỗ trợ Linear Score Fusion (Min-Max normalization + Weighted Sum) thay thế/song song RRF
 """
 import logging
 from typing import Dict, List, Optional, Tuple
@@ -14,24 +11,63 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# RRF Fusion
+# RRF Fusion (Giữ lại để tương thích ngược nếu cần)
 # ---------------------------------------------------------------------------
 
 def reciprocal_rank_fusion(
     *ranked_lists: List[Tuple[str, float]], k: int = 60
 ) -> List[Tuple[str, float]]:
-    """
-    Dung hòa nhiều ranked list bằng Reciprocal Rank Fusion.
-
-    Score_RRF(d) = Σ_list  1 / (k + rank(d, list))
-
-    Nhận *ranked_lists để hỗ trợ bất kỳ số list nào (BM25, Dense, ...).
-    """
     scores: Dict[str, float] = {}
     for ranked in ranked_lists:
         for rank, (cid, _) in enumerate(ranked):
             scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# ★ MỚI: Linear Score Fusion (Min-Max Normalization + Weighted Sum)
+# ---------------------------------------------------------------------------
+
+def min_max_normalize(ranked_list: List[Tuple[str, float]]) -> Dict[str, float]:
+    """Chuẩn hóa score của một list về khoảng [0, 1] bằng Min-Max Scaling."""
+    if not ranked_list:
+        return {}
+    scores = [score for _, score in ranked_list]
+    min_s, max_s = min(scores), max(scores)
+    
+    # Trường hợp tất cả score bằng nhau
+    if max_s == min_s:
+        return {cid: 1.0 for cid, _ in ranked_list}
+        
+    normalized = {}
+    for cid, score in ranked_list:
+        normalized[cid] = (score - min_s) / (max_s - min_s)
+    return normalized
+
+
+def linear_score_fusion(
+    bm25_ranked: List[Tuple[str, float]],
+    dense_ranked: List[Tuple[str, float]],
+    alpha: float = 0.4,
+    beta: float = 0.6,
+) -> List[Tuple[str, float]]:
+    """
+    Kết hợp tuyến tính điểm số giữa BM25 và Dense sau khi đã Min-Max Normalize.
+    Final_Score(d) = alpha * Norm_BM25(d) + beta * Norm_Dense(d)
+    """
+    bm25_norm = min_max_normalize(bm25_ranked)
+    dense_norm = min_max_normalize(dense_ranked)
+    
+    all_cids = set(bm25_norm.keys()).union(set(dense_norm.keys()))
+    fused_scores: Dict[str, float] = {}
+    
+    for cid in all_cids:
+        s_bm25 = bm25_norm.get(cid, 0.0)  # Nếu không có trong list, gán 0
+        s_dense = dense_norm.get(cid, 0.0)
+        
+        fused_scores[cid] = alpha * s_bm25 + beta * s_dense
+        
+    return sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -43,11 +79,6 @@ def aggregate_chunks_to_docs(
     chunk_to_doc_map: Dict[str, int],
     max_docs: int = 5,
 ) -> List[Tuple[int, float]]:
-    """
-    Max-pooling: điểm của Document = điểm lớn nhất trong các chunk của nó.
-
-    Trả về: List[(doc_id, score)] đã sắp xếp giảm dần, tối đa max_docs.
-    """
     doc_scores: Dict[int, float] = {}
     for cid, score in ranked_chunks:
         did = chunk_to_doc_map.get(cid)
@@ -69,19 +100,6 @@ def apply_dynamic_threshold(
     score_margin: float = 4.5,
     max_docs: int = 5,
 ) -> List[str]:
-    """
-    Lọc danh sách doc_ids dựa trên điểm Cross-Encoder:
-
-    Giữ doc_i nếu:
-      1. score_i >= min_ce_score  (ngưỡng tuyệt đối tối thiểu)
-      2. score_top1 - score_i <= score_margin  (không quá xa top-1)
-
-    Luôn giữ ít nhất 1 document (top-1).
-    Không bao giờ vượt max_docs (ràng buộc cuộc thi).
-
-    Returns:
-        List[str] — danh sách doc_id (string) đã lọc.
-    """
     if not doc_score_pairs:
         return []
 
@@ -89,14 +107,11 @@ def apply_dynamic_threshold(
     selected: List[str] = []
 
     for doc_id, score in doc_score_pairs[:max_docs]:
-        # Luôn giữ top-1
         if not selected:
             selected.append(str(doc_id))
             continue
-        # Kiểm tra ngưỡng tuyệt đối
         if score < min_ce_score:
             break
-        # Kiểm tra khoảng cách so với top-1
         if (top_score - score) > score_margin:
             break
         selected.append(str(doc_id))
@@ -131,22 +146,6 @@ class HybridRetriever:
         raw_query: str,
         query_vec: Optional[np.ndarray],
     ) -> List[str]:
-        """
-        3-Stage True Hybrid Retrieval cho 1 câu hỏi:
-
-        Stage 1 — Candidate Generation (song song, độc lập):
-          ├─ BM25 Full-Corpus Search → Top bm25_k chunks
-          └─ Dense Full-Corpus Search → Top dense_k chunks  ← MỚI
-
-        Stage 2 — RRF Fusion:
-          BM25_list ⊕ Dense_list → Top rrf_out chunks
-
-        Stage 3 — Cross-Encoder Rerank:
-          Top cross_k chunks → Cross-Encoder score → Sorted list
-
-        Post-processing:
-          Max-pool chunks → doc scores → Dynamic Threshold → 1~5 doc_ids
-        """
         cfg_bm25 = self.cfg.bm25
         cfg_dense = self.cfg.dense
         cfg_ce = self.cfg.cross_encoder
@@ -164,13 +163,19 @@ class HybridRetriever:
                 query_vec, top_k=cfg_dense.dense_top_k
             )
 
-        # ── Stage 2: RRF Fusion ─────────────────────────────────────────
+        # ── Stage 2: Fusion (RRF hoặc Linear Score Fusion) ─────────────
         if dense_res:
-            hybrid_res = reciprocal_rank_fusion(
-                bm25_res, dense_res, k=cfg_hybrid.rrf_k
-            )
+            if cfg_hybrid.fusion_method == "linear":
+                hybrid_res = linear_score_fusion(
+                    bm25_res, dense_res, 
+                    alpha=cfg_hybrid.alpha_bm25, 
+                    beta=cfg_hybrid.beta_dense
+                )
+            else:
+                hybrid_res = reciprocal_rank_fusion(
+                    bm25_res, dense_res, k=cfg_hybrid.rrf_k
+                )
         else:
-            # Fallback: chỉ dùng BM25 nếu Dense không khả dụng
             hybrid_res = bm25_res
 
         # ── Stage 3: Cross-Encoder Rerank ──────────────────────────────
@@ -183,7 +188,6 @@ class HybridRetriever:
             ]
             reranked = self.cross.rerank(raw_query, candidates_text)
         else:
-            # Không có Cross-Encoder: chuyển hybrid_res sang định dạng tương tự
             reranked = hybrid_res
 
         # ── Aggregate Chunks → Documents ────────────────────────────────
@@ -193,7 +197,6 @@ class HybridRetriever:
 
         # ── Dynamic Threshold / Static Top-K ────────────────────────────
         if cfg_hybrid.dynamic_threshold_enabled and self.cross and cfg_ce.enabled:
-            # Khi có Cross-Encoder: dùng dynamic margin filtering
             selected = apply_dynamic_threshold(
                 doc_score_pairs,
                 min_ce_score=cfg_hybrid.min_ce_score,
@@ -201,7 +204,6 @@ class HybridRetriever:
                 max_docs=cfg_hybrid.max_docs_per_query,
             )
         else:
-            # Không có Cross-Encoder hoặc tắt dynamic: lấy cố định Top-K
             selected = [str(did) for did, _ in doc_score_pairs]
 
         return selected
@@ -212,7 +214,6 @@ class HybridRetriever:
         raw_queries: List[str],
         query_vecs: Optional[np.ndarray],
     ) -> Dict[int, List[str]]:
-        """Chạy retrieve_one cho toàn bộ batch queries."""
         from tqdm import tqdm
 
         results: Dict[int, List[str]] = {}
