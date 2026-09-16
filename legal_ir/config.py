@@ -65,8 +65,8 @@ class HybridConfig:
     rrf_k: int = 60
     
     # Trọng số tuyến tính cho BM25 và Dense
-    alpha_bm25: float = 0.4      
-    beta_dense: float = 0.6      
+    alpha_bm25: float = 0.5      
+    beta_dense: float = 0.5      
     
     max_docs_per_query: int = 5
 
@@ -82,5 +82,5 @@ class Config:
     dense: DenseConfig = field(default_factory=DenseConfig)
     cross_encoder: CrossEncoderConfig = field(default_factory=CrossEncoderConfig)
     hybrid: HybridConfig = field(default_factory=HybridConfig)
-
+    mode: str = "predict"
 CFG = Config()
