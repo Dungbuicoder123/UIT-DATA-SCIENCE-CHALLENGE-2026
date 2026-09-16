@@ -1,12 +1,14 @@
 """
 LegalIR — Main Pipeline Entry Point
-Nâng cấp: Tích hợp Query Expansion + True Hybrid Retrieval
+Nâng cấp: Tích hợp Query Expansion + True Hybrid Retrieval + Grid Search Tuning Mode
 """
 import argparse
 import logging
 import os
 import pickle
 import sys
+import numpy as np
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,6 +21,7 @@ from legal_ir.config import (
     EMBEDDINGS_CACHE_PATH,
     OUTPUT_DIR,
     PUBLIC_TEST_FILE,
+    TRAIN_FILE,  # ── [ĐÃ THÊM] Import đường dẫn TRAIN_FILE từ config
 )
 from legal_ir.data_loader import (
     clean_text,
@@ -29,7 +32,12 @@ from legal_ir.data_loader import (
 from legal_ir.bm25_retriever import BM25Retriever
 from legal_ir.dense_retriever import DenseRetriever
 from legal_ir.cross_encoder import CrossEncoderRanker
-from legal_ir.hybrid_ranker import HybridRetriever
+from legal_ir.hybrid_ranker import (
+    HybridRetriever, 
+    linear_score_fusion,             # ── [ĐÃ THÊM] Import hàm Linear Fusion
+    aggregate_chunks_to_docs,        # ── [ĐÃ THÊM] Dùng cho hàm evaluate tune
+    apply_dynamic_threshold          # ── [ĐÃ THÊM] Dùng cho hàm evaluate tune
+)
 from legal_ir.exporter import export_submission
 from legal_ir.query_expander import expand_query
 
@@ -160,12 +168,163 @@ def run_predict(force_rebuild: bool = False):
     print("\n🎯 Pipeline hoàn tất!")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ── [ĐÃ THÊM] HÀM RUN_TUNE ĐỂ CHẠY GRID SEARCH TỰ ĐỘNG QUÉT ALPHA & BETA ──
+# ─────────────────────────────────────────────────────────────────────────────
+def run_tune(force_rebuild: bool = False):
+    """
+    Chạy Grid Search quét trọng số alpha (BM25) và beta (Dense) trên tập train.json
+    để tìm tỷ lệ vàng đạt Local Recall@5 cao nhất.
+    """
+    bm25, dense, cross, chunk_map, raw_texts_dict = build_corpus_index(force_rebuild)
+
+    print("\n" + "═" * 60)
+    print("Bước 5 (Tune): Load & Preprocess Validation Queries từ train.json...")
+    print("═" * 60)
+    
+    if not os.path.exists(TRAIN_FILE):
+        logger.error(f"Không tìm thấy file train tại: {TRAIN_FILE}")
+        return
+
+    queries = load_queries(TRAIN_FILE)
+    val_queries = queries[:300]  # Lấy 300 câu đầu làm tập validation cục bộ
+    
+    query_ids = []
+    raw_questions = []
+    ground_truths = {}
+
+    for q in val_queries:
+        qid = str(q.get("id"))
+        q_text = q.get("question") or q.get("query") or ""
+        ans = q.get("answer") or q.get("documents") or q.get("doc_ids") or q.get("document_id") or []
+        
+        if qid and q_text:
+            query_ids.append(qid)
+            raw_questions.append(clean_text(str(q_text)))
+            if isinstance(ans, (list, tuple)):
+                ground_truths[qid] = [str(d) for d in ans]
+            else:
+                ground_truths[qid] = [str(ans)]
+
+    # Query Expansion & Preprocessing
+    if CFG.text.query_expansion:
+        expanded_questions = [expand_query(q) for q in raw_questions]
+    else:
+        expanded_questions = raw_questions
+
+    processed_queries = [preprocess(q, CFG.text.word_segmenter) for q in expanded_questions]
+
+    query_vecs = None
+    if dense:
+        print("Encode query vectors cho validation...")
+        query_vecs = dense.encode_queries_batch(expanded_questions)
+
+    print("\nTrích xuất trước kết quả Stage 1 (BM25 & Dense) để tăng tốc quét...")
+    bm25_results_all = []
+    dense_results_all = []
+    for i, p_q in enumerate(tqdm(processed_queries, desc="Stage 1 Pre-retrieval")):
+        bm25_res = bm25.retrieve(p_q, top_k=CFG.bm25.top_k_stage1)
+        bm25_results_all.append(bm25_res)
+        
+        dense_res = []
+        if dense and query_vecs is not None:
+            dense_res = dense.search_full_corpus(query_vecs[i], top_k=CFG.dense.dense_top_k)
+        dense_results_all.append(dense_res)
+
+    # Quét Grid Search Alpha từ 0.0 đến 1.0 (step 0.1)
+    alphas = [round(a, 1) for a in np.linspace(0.0, 1.0, 11)]
+    best_recall = -1.0
+    best_alpha = CFG.hybrid.alpha_bm25
+
+    print("\n" + "═" * 60)
+    print("Bắt đầu quét Grid Search Alpha (BM25) / Beta (Dense)...")
+    print("═" * 60)
+
+    for alpha in alphas:
+        beta = round(1.0 - alpha, 1)
+        correct_hits = 0
+        valid_count = 0
+
+        for i in range(len(query_ids)):
+            qid = query_ids[i]
+            gt_docs = ground_truths.get(qid, [])
+            if not gt_docs:
+                continue
+            valid_count += 1
+
+            bm25_res = bm25_results_all[i]
+            dense_res = dense_results_all[i]
+
+            # Linear Fusion
+            if dense_res:
+                hybrid_res = linear_score_fusion(bm25_res, dense_res, alpha=alpha, beta=beta)
+            else:
+                hybrid_res = bm25_res
+
+            # Cross-Encoder Rerank
+            if cross and CFG.cross_encoder.enabled:
+                top_chunks_for_ce = hybrid_res[: CFG.cross_encoder.top_k_stage3]
+                candidates_text = [
+                    (cid, raw_texts_dict[cid]) for cid, _ in top_chunks_for_ce if cid in raw_texts_dict
+                ]
+                reranked = cross.rerank(expanded_questions[i], candidates_text)
+            else:
+                reranked = hybrid_res
+
+            doc_score_pairs = aggregate_chunks_to_docs(reranked, chunk_map, max_docs=CFG.hybrid.max_docs_per_query)
+            
+            if CFG.hybrid.dynamic_threshold_enabled and cross and CFG.cross_encoder.enabled:
+                selected = apply_dynamic_threshold(
+                    doc_score_pairs,
+                    min_ce_score=CFG.hybrid.min_ce_score,
+                    score_margin=CFG.hybrid.score_margin,
+                    max_docs=CFG.hybrid.max_docs_per_query,
+                )
+            else:
+                selected = [str(did) for did, _ in doc_score_pairs]
+
+            # Tính Recall@5
+            if any(g in selected for g in gt_docs):
+                correct_hits += 1
+
+        recall_score = correct_hits / valid_count if valid_count > 0 else 0.0
+        print(f"Alpha (BM25) = {alpha:.1f} | Beta (Dense) = {beta:.1f} ---> Local Recall@5 = {recall_score:.4f}")
+
+        if recall_score > best_recall:
+            best_recall = recall_score
+            best_alpha = alpha
+
+    print("\n" + "═" * 60)
+    print(f"🎯 KẾT QUẢ TỐI ƯU TỪ GRID SEARCH:")
+    print(f"alpha_bm25 = {best_alpha:.1f} | beta_dense = {round(1.0 - best_alpha, 1)}")
+    print(f"Local Recall@5 cao nhất đạt được: {best_recall:.4f}")
+    print("═" * 60)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LegalIR Prediction Pipeline")
+    
+    # ── [ĐÃ THÊM] Thêm tham số --mode để chuyển đổi giữa predict và tune ──
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="predict",
+        choices=["predict", "tune"],
+        help="Chế độ chạy: 'predict' để tạo file submission, 'tune' để quét alpha/beta",
+    )
+    # ─────────────────────────────────────────────────────────────────────
+
     parser.add_argument(
         "--force-rebuild",
         action="store_true",
         help="Xây dựng lại toàn bộ index (bỏ qua cache)",
     )
     args = parser.parse_args()
-    run_predict(force_rebuild=args.force_rebuild)
+
+    # ── [ĐÃ THÊM] Điều hướng gọi hàm tùy thuộc vào mode được truyền vào ──
+    if args.mode == "tune":
+        run_tune(force_rebuild=args.force_rebuild)
+    else:
+        run_predict(force_rebuild=args.force_rebuild)
+    # ─────────────────────────────────────────────────────────────────────
